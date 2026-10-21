@@ -9,19 +9,19 @@ Always pin a tag or a commit SHA instead of `main`.
 ## Report (no changes on the server)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.0/php2shell-fix.sh | sudo bash -s -- --check
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.1/php2shell-fix.sh | sudo bash -s -- --check
 ```
 
 ## Patch
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.0/php2shell-fix.sh | sudo bash -s -- --apply
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.1/php2shell-fix.sh | sudo bash -s -- --apply
 ```
 
 ## With checksum verification
 
 ```bash
-curl -fsSLo /tmp/php2shell-fix.sh https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.0/php2shell-fix.sh && echo "CHECKSUM  /tmp/php2shell-fix.sh" | sha256sum -c && sudo bash /tmp/php2shell-fix.sh --apply
+curl -fsSLo /tmp/php2shell-fix.sh https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.1/php2shell-fix.sh && echo "CHECKSUM  /tmp/php2shell-fix.sh" | sha256sum -c && sudo bash /tmp/php2shell-fix.sh --apply
 ```
 
 Compute the checksum on your own machine: `shasum -a 256 php2shell-fix.sh`.
@@ -29,11 +29,11 @@ Compute the checksum on your own machine: `shasum -a 256 php2shell-fix.sh`.
 ## Many servers
 
 ```bash
-for h in $(cat servers.txt); do ssh root@$h 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.0/php2shell-fix.sh | bash -s -- --check' 2>&1 | grep '^RESULT'; done
+for h in $(cat servers.txt); do ssh root@$h 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.1/php2shell-fix.sh | bash -s -- --check' 2>&1 | grep '^RESULT'; done
 ```
 
 ```bash
-cat servers.txt | xargs -P5 -I{} sh -c "ssh root@{} 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.0/php2shell-fix.sh | bash -s -- --apply' > out-{}.log 2>&1; grep '^RESULT' out-{}.log"
+cat servers.txt | xargs -P5 -I{} sh -c "ssh root@{} 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.1/php2shell-fix.sh | bash -s -- --apply' > out-{}.log 2>&1; grep '^RESULT' out-{}.log"
 ```
 
 ## Options

@@ -2,7 +2,7 @@
 set -u
 export LC_ALL=C
 
-VERSION=1.0
+VERSION=1.1
 CVES=(CVE-2026-109618 CVE-2026-109619)
 MODE=check
 RESTART=1
@@ -351,8 +351,34 @@ sury_repo_present() {
   grep -rlqE 'packages\.sury\.org' /etc/apt/sources.list.d /etc/apt/sources.list 2>/dev/null
 }
 
+sury_fixed_revision() {
+  case "$1" in
+    5.6) echo 5.6.40-104 ;;
+    7.0) echo 7.0.33-92 ;;
+    7.1) echo 7.1.33-80 ;;
+    7.2) echo 7.2.34-66 ;;
+    7.3) echo 7.3.33-35 ;;
+    7.4) echo 7.4.33-31 ;;
+    8.0) echo 8.0.30-25 ;;
+    8.1) echo 8.1.34-9 ;;
+  esac
+}
+
+candidate_is_fixed() {
+  local cand=${1#*:} up branch fixed
+  up=${cand%%-*}
+  branch=${up%.*}
+  fixed=$(min_fixed "$branch")
+  if [ -n "$fixed" ]; then
+    version_ge "$up" "$fixed"
+    return
+  fi
+  fixed=$(sury_fixed_revision "$branch")
+  [ -n "$fixed" ] && dpkg --compare-versions "$cand" ge "$fixed"
+}
+
 needs_sury_switch() {
-  local entry bin pkg cand up branch fixed
+  local entry bin pkg cand
   for entry in "${UNPATCHED[@]:-}"; do
     [ -n "$entry" ] || continue
     bin=${entry%%|*}
@@ -361,13 +387,7 @@ needs_sury_switch() {
     dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null | grep -qi 'sury' || continue
     cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}')
     [ -n "$cand" ] && [ "$cand" != "(none)" ] || continue
-    up=${cand#*:}
-    up=${up%%-*}
-    branch=${up%.*}
-    fixed=$(min_fixed "$branch")
-    if [ -z "$fixed" ] || ! version_ge "$up" "$fixed"; then
-      return 0
-    fi
+    candidate_is_fixed "$cand" || return 0
   done
   return 1
 }
