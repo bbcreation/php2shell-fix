@@ -2,7 +2,7 @@
 set -u
 export LC_ALL=C
 
-VERSION=1.3
+VERSION=1.4
 CVES=(CVE-2026-109618 CVE-2026-109619)
 MODE=check
 RESTART=1
@@ -449,8 +449,32 @@ switch_to_sury() {
   return 1
 }
 
+ppa_built_packages() {
+  dpkg-query -W -f='${Package} ${Version}\n' 2>/dev/null | awk '/deb\.sury\.org\+1/ {print $1}' | grep -E '^(php[0-9]+\.[0-9]+(-|$))' 
+}
+
+align_to_sury() {
+  local p v args=()
+  for p in $(ppa_built_packages); do
+    v=$(apt-cache madison "$p" 2>/dev/null | grep packages.sury.org | head -n1 | awk '{print $3}')
+    [ -n "$v" ] && [ "$v" != "$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)" ] && args+=("$p=$v")
+  done
+  if [ "${#args[@]}" -eq 0 ]; then
+    return 0
+  fi
+  log "aligning ${#args[@]} PHP packages to the packages.sury.org builds"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades \
+    -o Acquire::Retries=3 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "${args[@]}" \
+    || log "ERROR: aligning packages to packages.sury.org failed"
+}
+
+apt_upgrade_php() {
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade \
+    -o Acquire::Retries=3 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef $1
+}
+
 update_packages() {
-  local pkgs held
+  local pkgs held switched=0
   pkgs=$(php_package_snapshot | awk '{print $1}' | sort -u | tr '\n' ' ')
   if [ -z "${pkgs// /}" ]; then
     log "no PHP packages installed via apt"
@@ -459,15 +483,23 @@ update_packages() {
   held=$(apt-mark showhold 2>/dev/null | grep -E '^php|^hestia-php' | tr '\n' ' ')
   [ -n "$held" ] && log "WARNING: PHP packages on hold, they will not be upgraded: $held"
   log "apt-get update"
-  apt-get update -qq || log "ERROR: apt-get update"
+  apt-get update -qq -o Acquire::Retries=2 -o Acquire::https::Timeout=30 -o Acquire::http::Timeout=30 || log "ERROR: apt-get update"
   if [ "$SWITCH_REPO" = 1 ] && ondrej_ppa_in_use && ! sury_repo_present; then
     print_report quiet
-    needs_sury_switch && switch_to_sury
+    needs_sury_switch && switch_to_sury && switched=1
   fi
+  [ "$switched" = 1 ] && align_to_sury
   log "apt-get install --only-upgrade: $pkgs"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade \
-    -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef $pkgs \
-    || log "ERROR: apt-get install --only-upgrade"
+  apt_upgrade_php "$pkgs" && return 0
+  log "ERROR: apt-get install --only-upgrade"
+  if [ "$switched" = 0 ] && [ "$SWITCH_REPO" = 1 ] && ondrej_ppa_in_use && ! sury_repo_present; then
+    log "the PPA could not deliver the packages, switching to packages.sury.org and retrying"
+    if switch_to_sury; then
+      align_to_sury
+      log "apt-get install --only-upgrade (retry): $pkgs"
+      apt_upgrade_php "$pkgs" || log "ERROR: apt-get install --only-upgrade (retry)"
+    fi
+  fi
 }
 
 build_hestia_php() {
@@ -595,7 +627,7 @@ main() {
   for entry in "${UNPATCHED[@]:-}"; do
     case "${entry%%|*}" in
       */frankenphp)
-        log "FrankenPHP bundles PHP ${entry##*|}: ${entry%%|*} (system PHP upgrades do not change it). Update it with: curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.3/frankenphp-update.sh | sudo bash -s -- ${entry%%|*}" ;;
+        log "FrankenPHP bundles PHP ${entry##*|}: ${entry%%|*} (system PHP upgrades do not change it). Update it with: curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.4/frankenphp-update.sh | sudo bash -s -- ${entry%%|*}" ;;
     esac
   done
 
