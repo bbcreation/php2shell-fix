@@ -2,7 +2,7 @@
 set -u
 export LC_ALL=C
 
-VERSION=1.2
+VERSION=1.3
 CVES=(CVE-2026-109618 CVE-2026-109619)
 MODE=check
 RESTART=1
@@ -595,7 +595,7 @@ main() {
   for entry in "${UNPATCHED[@]:-}"; do
     case "${entry%%|*}" in
       */frankenphp)
-        log "FrankenPHP bundles PHP ${entry##*|}: ${entry%%|*} (upgrading system PHP does not change it, it needs a FrankenPHP release with fixed PHP or a new image)" ;;
+        log "FrankenPHP bundles PHP ${entry##*|}: ${entry%%|*} (system PHP upgrades do not change it). Update it with: curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.3/frankenphp-update.sh | sudo bash -s -- ${entry%%|*}" ;;
     esac
   done
 
