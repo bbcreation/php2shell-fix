@@ -2,7 +2,7 @@
 set -u
 export LC_ALL=C
 
-VERSION=1.1
+VERSION=1.2
 CVES=(CVE-2026-109618 CVE-2026-109619)
 MODE=check
 RESTART=1
@@ -21,7 +21,7 @@ Usage: php2shell-fix.sh [options]   (from the network: curl -fsSL <URL> | sudo b
   --check            report only, no changes (default)
   --apply            upgrade PHP packages, build source-installed PHP 7.4/8.0/8.1, restart php-fpm (needs root)
   --no-switch-repo   with --apply: do not switch from the ondrej/php PPA to packages.sury.org when the PPA has no fix yet
-  --no-build-source  with --apply: do not build package-less PHP 7.4/8.0/8.1 from source (release tag + fix from github.com/php/php-src)
+  --no-build-source  with --apply: do not build from source (package-less PHP 7.4/8.0/8.1 with the php-src fix, and hestia-php from the fixed release when Hestia has no fixed package yet)
   --no-restart       with --apply: do not restart services
   -h, --help         this help
 Exit code: 0 = everything patched or no PHP found, 1 = vulnerable binaries left or processes still on the old binary
@@ -209,24 +209,32 @@ ensure_build_deps() {
 }
 
 build_and_install() {
-  local branch=$1 sha=$2 cmd=$3 binlist=$4 dir prefix jobs tool b after
+  local branch=$1 sha=$2 cmd=$3 binlist=$4 tag=${5:-} dir prefix jobs tool b after label hestia=0 rc
   local -A before=()
+  [ -n "$tag" ] || tag=$(backport_tag "$branch")
   ensure_build_deps "$branch" "$cmd" || return 1
   for tool in gcc make autoconf bison re2c curl tar patch; do
     command -v "$tool" >/dev/null 2>&1 || { log "ERROR: '$tool' is still missing after installation, skipping the PHP $branch build"; return 1; }
   done
-  dir=/usr/local/src/php2shell-$branch-$STAMP
+  dir=/usr/local/src/php2shell-$branch-$STAMP-$$-$RANDOM
   jobs=$(nproc 2>/dev/null || echo 2)
   [ "$jobs" -gt 4 ] && jobs=4
   mkdir -p "$dir"
-  log "building PHP $branch: $(backport_tag "$branch") + php-src fix @$sha (log: $dir.log)"
+  if [ -n "$sha" ]; then
+    label="$tag + php-src fix @$sha"
+  else
+    label="$tag"
+  fi
+  log "building PHP $branch: $label (log: $dir.log)"
   (
     set -e
     set -o pipefail
     cd "$dir"
-    curl -fsSL "https://github.com/php/php-src/archive/refs/tags/$(backport_tag "$branch").tar.gz" | tar xz --strip-components=1
-    curl -fsSL "https://github.com/php/php-src/commit/$sha.patch" | patch -p1
-    grep -q zend_mm_safe_error_ex Zend/zend_alloc.c
+    curl -fsSL "https://github.com/php/php-src/archive/refs/tags/$tag.tar.gz" | tar xz --strip-components=1
+    if [ -n "$sha" ]; then
+      curl -fsSL "https://github.com/php/php-src/commit/$sha.patch" | patch -p1
+      grep -q zend_mm_safe_error_ex Zend/zend_alloc.c
+    fi
     ./buildconf --force
     eval "set -- $cmd"
     shift
@@ -242,13 +250,21 @@ build_and_install() {
   mkdir -p "$BACKUP_DIR"
   tar czf "$BACKUP_DIR/php-$branch-$(echo "$prefix" | tr / _).tgz" -C "$prefix" $(cd "$prefix" && ls -d bin sbin 2>/dev/null) 2>/dev/null
   echo "$cmd" | grep -q 'apxs' && log "WARNING: PHP $branch has mod_php (apxs), make install may modify the Apache configuration"
-  (cd "$dir" && make install) >>"$dir.log" 2>&1 </dev/null || { log "ERROR: make install for PHP $branch failed, log: $dir.log, backup: $BACKUP_DIR"; return 1; }
+  [ "$prefix" = /usr/local/hestia/php ] && hestia=1
+  [ "$hestia" = 1 ] && systemctl stop hestia >/dev/null 2>&1
+  (cd "$dir" && make install) >>"$dir.log" 2>&1 </dev/null
+  rc=$?
+  if [ "$rc" = 0 ] && [ "$hestia" = 1 ]; then
+    cp -f "$prefix/sbin/php-fpm" "$prefix/sbin/hestia-php.new" && mv -f "$prefix/sbin/hestia-php.new" "$prefix/sbin/hestia-php" || rc=1
+  fi
+  [ "$hestia" = 1 ] && systemctl start hestia >/dev/null 2>&1
+  [ "$rc" = 0 ] || { log "ERROR: make install for PHP $branch failed, log: $dir.log, backup: $BACKUP_DIR"; return 1; }
   CHANGED=1
   while read -r b; do
     [ -n "$b" ] || continue
     after=$(binary_hash "$b")
     if [ "$after" != "${before[$b]:-}" ] && [ "$(binary_version "$b" | cut -d. -f1,2)" = "$branch" ]; then
-      mark_source_build "$b" "$sha"
+      mark_source_build "$b" "${sha:-release-$tag}"
       log "installed patched PHP $branch: $b (backup of old binaries: $BACKUP_DIR)"
     else
       log "WARNING: $b did not change after make install, check that the prefix ($prefix) is correct"
@@ -454,6 +470,36 @@ update_packages() {
     || log "ERROR: apt-get install --only-upgrade"
 }
 
+build_hestia_php() {
+  local entry bin ver branch fixed cmd="" bins="" tag="" hbranch=""
+  for entry in "${UNPATCHED[@]:-}"; do
+    [ -n "$entry" ] || continue
+    bin=${entry%%|*}
+    ver=${entry##*|}
+    case "$bin" in /usr/local/hestia/php/*) ;; *) continue ;; esac
+    [ -n "$ver" ] || continue
+    branch=${ver%.*}
+    fixed=$(min_fixed "$branch")
+    [ -n "$fixed" ] || continue
+    tag=php-$fixed
+    hbranch=$branch
+    bins+="$bin"$'\n'
+    if [ -z "$cmd" ]; then
+      cmd=$(timeout 10 "$bin" -i 2>/dev/null </dev/null | sed -n 's/^Configure Command => *//p' | head -n1)
+    fi
+  done
+  [ -n "$bins" ] || return 0
+  if [ -z "$cmd" ] && [ -x /usr/local/hestia/php/bin/php ]; then
+    cmd=$(timeout 10 /usr/local/hestia/php/bin/php -i 2>/dev/null </dev/null | sed -n 's/^Configure Command => *//p' | head -n1)
+  fi
+  if [ -z "$cmd" ]; then
+    log "ERROR: cannot read the Configure Command of hestia-php, rebuild it manually"
+    return 1
+  fi
+  log "hestia-php is below the fixed release and the Hestia repository has no fix yet, rebuilding it from $tag"
+  build_and_install "$hbranch" "" "$cmd" "$bins" "$tag"
+}
+
 restart_unit() {
   log "restart $1"
   systemctl restart "$1" || log "ERROR: restart of $1 failed"
@@ -533,6 +579,8 @@ main() {
     if [ "$BUILD_SOURCE" = 1 ]; then
       print_report quiet
       build_source_backport
+      print_report quiet
+      build_hestia_php
     fi
 
     stale=$(stale_processes)
