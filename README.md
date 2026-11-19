@@ -7,20 +7,20 @@
 Paste on the server (as root or a sudo user). The script first shows every PHP it found (version, safe version, where it comes from: distro, sury, ppa-ondrej, source, hestia, frankenphp) and the plan (which packages it upgrades, what it builds from source, which php-fpm it restarts), then asks `Proceed with the plan above? [y/N]`. Nothing changes until you answer `y`:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/php-smuggling-fix.sh | sudo bash -s -- --apply
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/php-smuggling-fix.sh | sudo bash -s -- --apply
 ```
 
 Everything in one go (upgrade, mitigations for what cannot be patched yet, then FrankenPHP unless you answered no):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/php-smuggling-fix.sh | sudo bash -s -- --apply --mitigate; [ $? -ne 3 ] && curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/frankenphp-update.sh | sudo bash -s --
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/php-smuggling-fix.sh | sudo bash -s -- --apply --mitigate; [ $? -ne 3 ] && curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/frankenphp-update.sh | sudo bash -s --
 ```
 
 ### Step by step
 
 1. Report without changes: `--check` (command below). It shows the same table and plan as `--apply`, and the `EXPOSED` and `FPM` lines.
 2. Patch: `--apply`, read the plan, answer `y`.
-3. Read the last line:
+3. Read the `--- result ---` section: one line per PHP binary, `UPGRADED` (from which PHP and package version to which, and from which repository), `ALREADY SAFE` or `STILL UNSAFE` (with the safe version), then `SUMMARY`. The last line is:
    - `status=OK`: done.
    - `status=STALE`: PHP is patched, but some processes still run the old binary (queue workers, Horizon, supervisor, Octane). Restart them (`php artisan horizon:terminate`, `supervisorctl restart all`) and run `--check` again.
    - `status=VULNERABLE`: the repository has no fixed package yet. Run `--mitigate` now and `--apply` again later.
@@ -35,7 +35,8 @@ The fixed versions are higher than the php2shell ones, so this script also cover
 
 It works like `php2shell-fix.sh` (upgrades packages, switches the ondrej/php PPA to packages.sury.org when needed), and additionally:
 
-- shows the plan and asks for confirmation before it changes anything (`--yes` skips the question),
+- shows the plan and asks for confirmation before it changes anything (`--yes` skips the question), and at the end a `--- result ---` section with the version change of every binary. The apt/dpkg output goes to the log, the screen shows only what changed and errors,
+- switches the ondrej/php PPA to packages.sury.org only when packages.sury.org has the fixed version for this release and architecture, and does not downgrade extensions there (a package that packages.sury.org has only in an older version, e.g. `php8.4-swoole`, stays from the PPA),
 - finds every running php-fpm master (systemd units, Hestia, supervisor programs, masters started by hand) and fully restarts it after the update, so OPcache is emptied and the new binary is loaded: `systemctl restart` for units, `supervisorctl restart` for supervisor programs, `kill -USR2` (php-fpm re-exec) for masters outside both; masters in containers are only reported. After the restart the `FPM` lines show which binary each master runs,
 - rebuilds package-less PHP 8.2-8.6 and `hestia-php` from the fixed php.net release, when the binary sits under its configure prefix,
 - rebuilds package-less PHP 7.4/8.0/8.1 from the last php.net release (7.4.33, 8.0.30, 8.1.34) plus the security patches from the packages.sury.org source package (`debian/patches`, sha256 checked against the signed-repository index). Debian packaging patches, `NEWS` and the Sury DNS telemetry patches are left out; the build stops if any code hunk does not apply or the CVE-2026-129289 / CVE-2026-109618 fixes are missing. Such binaries keep their version number, so the script records them in `/var/lib/php-smuggling-fix/`,
@@ -44,25 +45,25 @@ It works like `php2shell-fix.sh` (upgrades packages, switches the ondrej/php PPA
 - with `--mitigate`: sets `fastcgi_keep_conn off` / `enablereuse=off` (after `nginx -t` / `apache2ctl -t`, restored on failure), writes `session.upload_progress.enabled = 0` (and `fatal_error_backtraces = 0` on 8.5) to `/etc/php/<ver>/{fpm,cgi,apache2}/conf.d/99-php-smuggling-mitigation.ini` for unpatched versions only, and removes that file once the version is patched.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/php-smuggling-fix.sh | sudo bash -s -- --check
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/php-smuggling-fix.sh | sudo bash -s -- --check
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/php-smuggling-fix.sh | sudo bash -s -- --apply
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/php-smuggling-fix.sh | sudo bash -s -- --apply
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/php-smuggling-fix.sh | sudo bash -s -- --apply --mitigate
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/php-smuggling-fix.sh | sudo bash -s -- --apply --mitigate
 ```
 
 ```bash
-for h in $(cat servers.txt); do ssh root@$h 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/php-smuggling-fix.sh | bash -s -- --check' 2>&1 | grep -E '^(RESULT|EXPOSED)'; done
+for h in $(cat servers.txt); do ssh root@$h 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/php-smuggling-fix.sh | bash -s -- --check' 2>&1 | grep -E '^(RESULT|EXPOSED)'; done
 ```
 
 Over ssh without a terminal the script cannot ask, so `--apply` needs `--yes` there (or `ssh -t` to answer on each server):
 
 ```bash
-for h in $(cat servers.txt); do ssh -t root@$h 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/php-smuggling-fix.sh | bash -s -- --apply'; done
+for h in $(cat servers.txt); do ssh -t root@$h 'curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/php-smuggling-fix.sh | bash -s -- --apply'; done
 ```
 
 | Option | What it does |
@@ -136,17 +137,17 @@ FrankenPHP embeds its own PHP, so system package upgrades do not touch it. `fran
 Check only (also auto-discovers binaries under `/home`, `/root`, `/srv`, `/opt`, `/var/www`, `/usr/local`):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/frankenphp-update.sh | sudo bash -s -- --check
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/frankenphp-update.sh | sudo bash -s -- --check
 ```
 
 Update every FrankenPHP binary found, or a specific one:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/frankenphp-update.sh | sudo bash -s --
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/frankenphp-update.sh | sudo bash -s --
 ```
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5/frankenphp-update.sh | sudo bash -s -- /home/forge/example.com
+curl -fsSL https://raw.githubusercontent.com/bbcreation/php2shell-fix/v1.5.1/frankenphp-update.sh | sudo bash -s -- /home/forge/example.com
 ```
 
 ## Limitations

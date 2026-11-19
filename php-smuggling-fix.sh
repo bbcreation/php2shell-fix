@@ -2,8 +2,8 @@
 set -u
 export LC_ALL=C
 
-VERSION=1.0
-REPO_TAG=v1.5
+VERSION=1.5.1
+REPO_TAG=v1.5.1
 FRANKENPHP_TAG=v1.13.6
 CVES=(CVE-2026-129289 CVE-2026-115560 CVE-2026-126714)
 MODE=check
@@ -14,10 +14,12 @@ MITIGATE=0
 ASSUME_YES=0
 APT_UPDATED=0
 PLAN_ANY=0
+declare -A REPORT=() BEFORE=()
 CHANGED=0
 APACHE_RESTART=0
 MARKER_DIR=${MARKER_DIR:-/var/lib/php-smuggling-fix}
 SURY_SOURCES=https://packages.sury.org/php/dists/bookworm/main/source/Sources.gz
+SURY_INDEX=${SURY_INDEX:-/tmp/php-smuggling-sury-index-$$}
 SURY_SKIP='telemetry|text-payload-to-send-CVE|README|NEWS|binary-distributions|garbage-collection|enchant_dict_is_in_session'
 STAMP=$(date +%Y%m%d-%H%M%S)
 LOG=${LOG:-/var/log/php-smuggling-fix.log}
@@ -127,6 +129,39 @@ package_has_fix() {
     { zcat -f "/usr/share/doc/$pkg/changelog.Debian.gz" 2>/dev/null; zcat -f "/usr/share/doc/$pkg/changelog.gz" 2>/dev/null; } | grep -q "$cve" || return 1
   done
   return 0
+}
+
+installed_version() {
+  dpkg-query -W -f='${Version}' "$1" 2>/dev/null
+}
+
+sury_version() {
+  apt-cache madison "$1" 2>/dev/null | grep packages.sury.org | head -n1 | awk '{print $3}'
+}
+
+upstream_version() {
+  local v=${1#*:}
+  echo "${v%%-*}"
+}
+
+proc_cmdline() {
+  { tr '\0' ' ' <"/proc/$1/cmdline"; } 2>/dev/null
+}
+
+run_logged() {
+  local out rc line
+  out=$("$@" 2>&1)
+  rc=$?
+  { echo "$out" >>"$LOG"; } 2>/dev/null
+  while read -r line; do
+    case "$line" in
+      "systemctl restart "*) log "needrestart: ${line}" ;;
+    esac
+  done <<<"$out"
+  if [ "$rc" != 0 ]; then
+    echo "$out" | grep -vE '^(Reading|Preparing|Unpacking|Selecting|Setting up|Processing|\(Reading)' | tail -n 20
+  fi
+  return "$rc"
 }
 
 binary_hash() {
@@ -430,7 +465,12 @@ binary_origin() {
     /usr/local/hestia/php/*) echo hestia; return ;;
   esac
   [ -n "$pkg" ] || { echo source; return; }
-  ver=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
+  case "$(package_source "$pkg")" in
+    *packages.sury.org*) echo sury; return ;;
+    *launchpad*ondrej*) echo ppa-ondrej; return ;;
+    http*) echo distro; return ;;
+  esac
+  ver=$(installed_version "$pkg")
   case "$ver" in
     *deb.sury.org*|*debsuryorg*)
       if ondrej_ppa_in_use && ! sury_repo_present; then echo ppa-ondrej; else echo sury; fi ;;
@@ -442,6 +482,7 @@ safe_version() {
   local ver=$1 origin=$2 branch fixed
   branch=${ver%.*}
   [ "$origin" = frankenphp ] && { echo "$(min_fixed "$branch")"; return; }
+  origin=${origin%+sury}
   fixed=$(min_fixed "$branch")
   [ -n "$fixed" ] && { echo "$fixed"; return; }
   version_ge "$branch" 8.7 && { echo "$ver"; return; }
@@ -450,6 +491,33 @@ safe_version() {
     distro) echo "changelog:${CVES[0]}" ;;
     *) [ -n "$(eol_tag "$branch")" ] && echo "$(eol_tag "$branch" | sed 's/^php-//')+sury" || echo "none (EOL)" ;;
   esac
+}
+
+package_source() {
+  apt-cache policy "$1" 2>/dev/null | awk '
+    /^ \*\*\* / { inst = 1; next }
+    inst && /^        [0-9]+ [a-z]+:/ { print $2; exit }
+    inst && !/^        / { exit }
+  '
+}
+
+sury_codename() {
+  echo "$(lsb_release -sc 2>/dev/null)/$(dpkg --print-architecture 2>/dev/null)"
+}
+
+sury_index_version() {
+  local cn
+  if [ ! -s "$SURY_INDEX" ]; then
+    cn=$(sury_codename)
+    curl -fsSL -m 60 "https://packages.sury.org/php/dists/${cn%/*}/main/binary-${cn#*/}/Packages.gz" 2>/dev/null | zcat -f >"$SURY_INDEX" 2>/dev/null
+  fi
+  awk -v want="$1" '$0 == "Package: " want { f = 1 } f && /^Version:/ { print $2; exit }' "$SURY_INDEX" 2>/dev/null
+}
+
+sury_has_fix() {
+  local v
+  v=$(sury_index_version "$1")
+  [ -n "$v" ] && candidate_is_fixed "$v"
 }
 
 package_candidate() {
@@ -467,7 +535,7 @@ binary_action() {
     return
   fi
   if [ -n "$pkg" ]; then
-    inst=$(dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null)
+    inst=$(installed_version "$pkg")
     cand=$(package_candidate "$pkg")
     if [ -n "$cand" ] && [ "$cand" != "(none)" ] && [ "$cand" != "$inst" ]; then
       if candidate_is_fixed "$cand"; then
@@ -477,8 +545,20 @@ binary_action() {
       fi
       return
     fi
+    if [ "$APT_UPDATED" = 0 ]; then
+      if [ "$SWITCH_REPO" = 1 ] && ondrej_ppa_in_use && ! sury_repo_present; then
+        echo "no newer $pkg in the local package lists (--check does not run apt-get update); --apply refreshes them first and switches the ondrej/php PPA to packages.sury.org if it still has nothing newer"
+      else
+        echo "no newer $pkg in the local package lists (--check does not run apt-get update); --apply refreshes them first"
+      fi
+      return
+    fi
     if [ "$SWITCH_REPO" = 1 ] && ondrej_ppa_in_use && ! sury_repo_present; then
-      echo "the ondrej/php PPA has no newer $pkg: switch to packages.sury.org and upgrade"
+      if sury_has_fix "$pkg"; then
+        echo "the ondrej/php PPA has no newer $pkg: switch to packages.sury.org ($(sury_codename)) and upgrade to $(sury_index_version "$pkg")"
+      else
+        echo "neither the ondrej/php PPA nor packages.sury.org ($(sury_codename)) has a fixed $pkg yet: use --mitigate now and --apply again later"
+      fi
       return
     fi
     case "$bin" in
@@ -509,6 +589,7 @@ print_report() {
   MANUAL=0
   UNPATCHED=()
   PLAN=()
+  [ -n "$quiet" ] || REPORT=()
   [ -n "$quiet" ] || emit "$(printf '%-10s %-11s %-16s %-11s %-26s %s' STATE VERSION SAFE ORIGIN PACKAGE BINARY)"
   while read -r bin; do
     [ -n "$bin" ] || continue
@@ -519,6 +600,8 @@ print_report() {
     pkg=$(echo "$line" | cut -d'|' -f3)
     if [ -z "$quiet" ]; then
       origin=$(binary_origin "$bin" "$pkg")
+      [ "$origin" = source ] && source_build_marked "$bin" && origin=source+sury
+      REPORT[$bin]="$state|$ver|$pkg|$( [ -n "$pkg" ] && installed_version "$pkg")|$origin"
       emit "$(printf '%-10s %-11s %-16s %-11s %-26s %s' "$state" "${ver:--}" "$( [ -n "$ver" ] && safe_version "$ver" "$origin" || echo -)" "$origin" "${pkg:--}" "$bin")"
       [ "$state" = PATCHED ] || PLAN+=("$bin: $(binary_action "$bin" "$state" "$ver" "$pkg" </dev/null)")
     fi
@@ -528,6 +611,34 @@ print_report() {
       VULNERABLE) BAD=$((BAD+1)); UNPATCHED+=("$bin|$ver") ;;
     esac
   done < <(collect_binaries)
+}
+
+print_summary() {
+  local bin a b astate aver apkg apv aorig bstate bver bpkg bpv borig total=0 safe=0 unsafe=0 extra
+  emit "--- result ---"
+  for bin in $(printf '%s\n' "${!REPORT[@]}" | sort); do
+    a=${REPORT[$bin]}
+    b=${BEFORE[$bin]:-}
+    IFS='|' read -r astate aver apkg apv aorig <<<"$a"
+    IFS='|' read -r bstate bver bpkg bpv borig <<<"$b"
+    total=$((total + 1))
+    if [ "$astate" != PATCHED ]; then
+      unsafe=$((unsafe + 1))
+      emit "STILL UNSAFE  $bin: PHP ${aver:-unknown}, safe from $( [ -n "$aver" ] && safe_version "$aver" "$aorig" || echo unknown)"
+      continue
+    fi
+    safe=$((safe + 1))
+    if [ "$bstate" = PATCHED ] && [ "$bver" = "$aver" ] && [ "$bpv" = "$apv" ]; then
+      emit "ALREADY SAFE  $bin: PHP $aver"
+    elif [ -n "$apkg" ]; then
+      emit "UPGRADED      $bin: PHP ${bver:-unknown} -> $aver ($apkg ${bpv:-unknown} -> $apv, ${borig:-unknown} -> $aorig)"
+    else
+      extra=""
+      [ "$aorig" = source+sury ] && extra=" + packages.sury.org security patches"
+      emit "UPGRADED      $bin: PHP ${bver:-unknown} -> $aver$extra (built from source)"
+    fi
+  done
+  emit "SUMMARY       $safe of $total PHP binaries are safe, $unsafe still unsafe"
 }
 
 print_plan() {
@@ -765,18 +876,24 @@ candidate_is_fixed() {
 }
 
 needs_sury_switch() {
-  local entry bin pkg cand
+  local entry bin pkg cand found=1
   for entry in "${UNPATCHED[@]:-}"; do
     [ -n "$entry" ] || continue
     bin=${entry%%|*}
     pkg=$(binary_owner "$bin")
     [ -n "$pkg" ] || continue
-    dpkg-query -W -f='${Version}' "$pkg" 2>/dev/null | grep -qi 'sury' || continue
-    cand=$(apt-cache policy "$pkg" 2>/dev/null | awk '/Candidate:/{print $2}')
+    installed_version "$pkg" | grep -qi 'sury' || continue
+    cand=$(package_candidate "$pkg")
     [ -n "$cand" ] && [ "$cand" != "(none)" ] || continue
-    candidate_is_fixed "$cand" || return 0
+    candidate_is_fixed "$cand" && continue
+    if sury_has_fix "$pkg"; then
+      found=0
+    else
+      log "packages.sury.org ($(sury_codename)) has no fixed $pkg yet either"
+    fi
   done
-  return 1
+  [ "$found" = 0 ] || log "staying on the ondrej/php PPA: switching would not bring a fix"
+  return "$found"
 }
 
 switch_to_sury() {
@@ -825,16 +942,23 @@ ppa_built_packages() {
 }
 
 align_to_sury() {
-  local p v args=()
+  local p v cur args=()
   for p in $(ppa_built_packages); do
-    v=$(apt-cache madison "$p" 2>/dev/null | grep packages.sury.org | head -n1 | awk '{print $3}')
-    [ -n "$v" ] && [ "$v" != "$(dpkg-query -W -f='${Version}' "$p" 2>/dev/null)" ] && args+=("$p=$v")
+    v=$(sury_version "$p")
+    [ -n "$v" ] || continue
+    cur=$(installed_version "$p")
+    [ "$v" != "$cur" ] || continue
+    if dpkg --compare-versions "$(upstream_version "$v")" lt "$(upstream_version "$cur")"; then
+      log "keeping $p $cur from the ondrej/php PPA, packages.sury.org has only the older $v"
+      continue
+    fi
+    args+=("$p=$v")
   done
   [ "${#args[@]}" -gt 0 ] || return 0
-  log "aligning ${#args[@]} PHP packages to the packages.sury.org builds"
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --allow-downgrades \
+  log "moving ${#args[@]} PHP packages to the packages.sury.org builds (details: $LOG)"
+  DEBIAN_FRONTEND=noninteractive run_logged apt-get install -y -qq --allow-downgrades \
     -o Acquire::Retries=3 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef "${args[@]}" \
-    || log "ERROR: aligning packages to packages.sury.org failed"
+    || log "ERROR: moving packages to packages.sury.org failed"
 }
 
 refresh_package_lists() {
@@ -844,7 +968,7 @@ refresh_package_lists() {
 }
 
 apt_upgrade_php() {
-  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --only-upgrade \
+  DEBIAN_FRONTEND=noninteractive run_logged apt-get install -y -qq --only-upgrade \
     -o Acquire::Retries=3 -o Dpkg::Options::=--force-confold -o Dpkg::Options::=--force-confdef $1
 }
 
@@ -863,7 +987,7 @@ update_packages() {
     needs_sury_switch && switch_to_sury && switched=1
   fi
   [ "$switched" = 1 ] && align_to_sury
-  log "apt-get install --only-upgrade: $pkgs"
+  log "apt-get install --only-upgrade (details: $LOG): $pkgs"
   apt_upgrade_php "$pkgs" && return 0
   log "ERROR: apt-get install --only-upgrade"
   if [ "$switched" = 0 ] && [ "$SWITCH_REPO" = 1 ] && ondrej_ppa_in_use && ! sury_repo_present; then
@@ -887,7 +1011,7 @@ FPM_UNIT_RE='^php.*fpm.*\.service$|^hestia\.service$|^frankenphp\.service$'
 fpm_master_pids() {
   local p cmd
   for p in /proc/[0-9]*; do
-    cmd=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null) || continue
+    cmd=$(proc_cmdline "${p#/proc/}")
     case "$cmd" in
       "php-fpm: master process"*) echo "${p#/proc/}" ;;
     esac
@@ -949,7 +1073,7 @@ describe_fpm_targets() {
     case "$kind" in
       unit) echo "systemctl restart $name" ;;
       supervisor) echo "supervisorctl restart $name" ;;
-      signal) echo "kill -USR2 $name (php-fpm master outside systemd/supervisor: $(tr '\0' ' ' <"/proc/$name/cmdline" 2>/dev/null | cut -c1-80))" ;;
+      signal) echo "kill -USR2 $name (php-fpm master outside systemd/supervisor: $(proc_cmdline "$name" | cut -c1-80))" ;;
       container) echo "skip php-fpm master $name: it runs in a container, rebuild/restart the container yourself" ;;
     esac
   done <<<"$(fpm_targets)"
@@ -995,7 +1119,7 @@ stale_processes() {
       *php*"(deleted)") ;;
       *) grep -qE '/libphp[0-9.]*\.so \(deleted\)$' "$p/maps" 2>/dev/null || continue ;;
     esac
-    echo "${p#/proc/} $(tr '\0' ' ' <"$p/cmdline" 2>/dev/null | cut -c1-110)"
+    echo "${p#/proc/} $(proc_cmdline "${p#/proc/}" | cut -c1-110)"
   done
 }
 
@@ -1017,6 +1141,7 @@ main() {
   done
 
   exec </dev/null
+  trap 'rm -f "$SURY_INDEX"' EXIT
 
   if ! command -v dpkg >/dev/null 2>&1 || ! command -v apt-get >/dev/null 2>&1; then
     echo "this script supports Debian/Ubuntu only (dpkg + apt-get)" >&2
@@ -1039,6 +1164,9 @@ main() {
   [ "$MODE" = apply ] && refresh_package_lists
   log "--- state before ---"
   print_report
+  for entry in "${!REPORT[@]}"; do
+    BEFORE[$entry]=${REPORT[$entry]}
+  done
 
   if [ $((OK + BAD + MANUAL)) -eq 0 ]; then
     log "no PHP found on this server, exiting"
@@ -1091,6 +1219,7 @@ main() {
     print_report
     print_exposure
     print_fpm_masters
+    print_summary
   fi
 
   for entry in "${UNPATCHED[@]:-}"; do
