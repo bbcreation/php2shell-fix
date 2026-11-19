@@ -2,7 +2,7 @@
 set -u
 export LC_ALL=C
 
-TAG=${FRANKENPHP_TAG:-v1.13.2}
+TAG=${FRANKENPHP_TAG:-v1.13.6}
 FORCE=${FORCE:-0}
 CHECK_ONLY=0
 PATHS=()
@@ -35,10 +35,11 @@ php_of() {
 
 min_fixed() {
   case "$1" in
-    8.2) echo 8.2.35 ;;
-    8.3) echo 8.3.36 ;;
-    8.4) echo 8.4.27 ;;
-    8.5) echo 8.5.12 ;;
+    8.2) echo 8.2.36 ;;
+    8.3) echo 8.3.37 ;;
+    8.4) echo 8.4.28 ;;
+    8.5) echo 8.5.13 ;;
+    8.6) echo 8.6.0 ;;
   esac
 }
 
@@ -52,7 +53,7 @@ is_fixed() {
   if [ -n "$fixed" ]; then
     version_ge "$1" "$fixed"
   else
-    version_ge "${1%.*}" 8.6
+    version_ge "${1%.*}" 8.7
   fi
 }
 
